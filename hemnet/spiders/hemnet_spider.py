@@ -3,6 +3,7 @@
 import re
 import json
 from pathlib import Path
+from datetime import datetime
 import scrapy
 
 from urllib.parse import urlparse, urljoin, urlencode
@@ -160,6 +161,68 @@ def _normalize_props(props):
     return normalized
 
 
+def _extract_active_listing(next_data):
+    state = next_data.get('props', {}).get('pageProps', {}).get('__APOLLO_STATE__', {})
+    if not isinstance(state, dict):
+        return None, {}
+    for key, value in state.items():
+        if key.startswith("ActivePropertyListing:") and isinstance(value, dict):
+            return value, state
+    return None, state
+
+
+def _resolve_ref(ref, state):
+    if isinstance(ref, dict):
+        key = ref.get("__ref")
+        if key:
+            return state.get(key, {})
+    return {}
+
+
+def _money_amount(value):
+    if isinstance(value, dict):
+        return value.get("amount")
+    return value
+
+
+def _resolve_location_name(ref, state):
+    data = _resolve_ref(ref, state)
+    if not data:
+        return None
+    return data.get("fullName") or data.get("name")
+
+
+def _resolve_locations(refs, state):
+    if not refs:
+        return None
+    names = []
+    for ref in refs:
+        name = _resolve_location_name(ref, state)
+        if name:
+            names.append(name)
+    return names or None
+
+
+def _parse_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        try:
+            if value.endswith("Z"):
+                value = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+    return None
+
+
 class HemnetSpider(scrapy.Spider):
     name = 'hemnetspider'
     rotate_user_agent = True
@@ -268,13 +331,18 @@ class HemnetSpider(scrapy.Spider):
                 if prop_entry:
                     props = prop_entry.get('property', {})
 
+        next_data = None
+        active_listing = None
+        apollo_state = {}
         if not props:
             next_data = _extract_next_data(response)
             if next_data:
-                props = _find_property_data(next_data) or {}
-                props = _normalize_props(props)
+                active_listing, apollo_state = _extract_active_listing(next_data)
+                if not active_listing:
+                    props = _find_property_data(next_data) or {}
+                    props = _normalize_props(props)
 
-        if not props:
+        if not props and not active_listing:
             self._write_err('NoProps', response.url)
             self._save_debug_html(response, "no_props")
             return
@@ -287,39 +355,61 @@ class HemnetSpider(scrapy.Spider):
 
         item['url'] = response.url
         slug = urlparse(response.url).path.split('/')[-1]
-        item['hemnet_id'] = props.get('id') or get_hemnet_id(response.url)
-        item['type'] = slug.split('-')[0]
+        if active_listing:
+            item['hemnet_id'] = int(active_listing.get('id') or get_hemnet_id(response.url))
+            housing_form = active_listing.get('housingForm') or {}
+            item['type'] = housing_form.get('name') or slug.split('-')[0]
+        else:
+            item['hemnet_id'] = props.get('id') or get_hemnet_id(response.url)
+            item['type'] = slug.split('-')[0]
 
-        raw_rooms = props.get('rooms')
+        raw_rooms = (
+            active_listing.get('numberOfRooms') if active_listing else props.get('rooms')
+        )
         try:
             if raw_rooms is not None:
                 item['rooms'] = float(raw_rooms)
         except Exception:
             pass
 
-        try:
-            fee = int(property_attributes.get(u'Avgift/månad', '')
-                      .replace(u' kr/m\xe5n', '').replace(u'\xa0', u''))
-        except ValueError:
-            fee = None
+        fee = None
+        if active_listing:
+            fee = _money_amount(active_listing.get('fee'))
+        else:
+            try:
+                fee = int(property_attributes.get(u'Avgift/månad', '')
+                          .replace(u' kr/m\xe5n', '').replace(u'\xa0', u''))
+            except ValueError:
+                fee = None
         item['monthly_fee'] = fee
 
         try:
-            living_area = props.get('living_area')
+            living_area = (
+                active_listing.get('livingArea')
+                if active_listing
+                else props.get('living_area')
+            )
             if living_area is not None:
                 item['square_meters'] = float(living_area)
         except Exception:
             pass
 
-        try:
-            cost = int(property_attributes.get(u'Driftskostnad', '')
-                       .replace(u' kr/\xe5r', '').replace(u'\xa0', u''))
-        except Exception:
-            cost = None
+        cost = None
+        if active_listing:
+            cost = _money_amount(active_listing.get('runningCosts'))
+        else:
+            try:
+                cost = int(property_attributes.get(u'Driftskostnad', '')
+                           .replace(u' kr/\xe5r', '').replace(u'\xa0', u''))
+            except Exception:
+                cost = None
         item['cost_per_year'] = cost
 
         # can be '2008-2009'
-        item['year'] = property_attributes.get(u'Byggår', '')
+        if active_listing and active_listing.get('legacyConstructionYear'):
+            item['year'] = str(active_listing.get('legacyConstructionYear'))
+        else:
+            item['year'] = property_attributes.get(u'Byggår', '')
 
         try:
             association = property_attributes.get(u'Förening').strip()
@@ -341,7 +431,15 @@ class HemnetSpider(scrapy.Spider):
             biarea = None
         item['biarea'] = biarea
 
-        if broker_node is not None:
+        if active_listing:
+            broker = _resolve_ref(active_listing.get('broker'), apollo_state)
+            agency = _resolve_ref(active_listing.get('brokerAgency'), apollo_state)
+            item['broker_name'] = broker.get('name', '') or ''
+            item['broker_phone'] = broker.get('phoneNumber', '') or ''
+            item['broker_email'] = broker.get('email', '') or ''
+            item['broker_firm'] = agency.get('name')
+            item['broker_firm_phone'] = agency.get('phoneNumber')
+        elif broker_node is not None:
             broker_name = broker_node.css('strong::text').extract_first()
             item['broker_name'] = broker_name.strip() if broker_name else ""
             broker_links = broker_node.css(
@@ -355,19 +453,100 @@ class HemnetSpider(scrapy.Spider):
                 except Exception:
                     pass
 
-        item['broker_firm'] = props.get('broker_agency')
+            item['broker_firm'] = props.get('broker_agency')
 
-        broker_firm_phone = None
-        if broker_node is not None:
+            broker_firm_phone = None
             firm_links = broker_node.css('.phone-number::attr("href")').extract()
             if len(firm_links) > 1:
                 broker_firm_phone = strip_phone(firm_links[1])
-        item['broker_firm_phone'] = broker_firm_phone
-        item['price'] = props.get('selling_price')
-        item['asked_price'] = props.get('price')
-        item['sold_date'] = props.get('sold_at_date')
-        item['address'] = props.get('street_address')
-        item['geographic_area'] = props.get('location')
+            item['broker_firm_phone'] = broker_firm_phone
+
+        if active_listing:
+            item['listing_url'] = active_listing.get('listingHemnetUrl')
+            item['title'] = active_listing.get('title')
+            item['description'] = active_listing.get('description')
+            item['housing_form'] = (active_listing.get('housingForm') or {}).get('name')
+            item['tenure'] = (active_listing.get('tenure') or {}).get('name')
+            item['days_on_hemnet'] = active_listing.get('daysOnHemnet')
+            item['is_new_construction'] = active_listing.get('isNewConstruction')
+            item['is_project'] = active_listing.get('isProject')
+            item['is_project_unit'] = active_listing.get('isProjectUnit')
+            item['is_upcoming'] = active_listing.get('isUpcoming')
+            item['is_foreclosure'] = active_listing.get('isForeclosure')
+            item['is_bidding_ongoing'] = active_listing.get('isBiddingOngoing')
+            item['bidding_started'] = active_listing.get('biddingStarted')
+            item['published_at'] = _parse_datetime(active_listing.get('publishedAt'))
+            item['times_viewed'] = active_listing.get('timesViewed')
+            item['verified_bidding'] = active_listing.get('verifiedBidding')
+            item['listing_broker_url'] = active_listing.get('listingBrokerUrl')
+            item['listing_broker_gallery_url'] = active_listing.get('listingBrokerGalleryUrl')
+            item['post_code'] = active_listing.get('postCode')
+            item['municipality_name'] = _resolve_location_name(
+                active_listing.get('municipality'), apollo_state
+            )
+            item['region_name'] = _resolve_location_name(
+                active_listing.get('region'), apollo_state
+            )
+            item['county_name'] = _resolve_location_name(
+                active_listing.get('county'), apollo_state
+            )
+            item['districts'] = _resolve_locations(
+                active_listing.get('districts'), apollo_state
+            )
+            item['labels'] = active_listing.get('labels')
+            item['relevant_amenities'] = active_listing.get('relevantAmenities')
+            item['listing_collection_ids'] = active_listing.get('listingCollectionIds')
+            item['breadcrumbs'] = active_listing.get('breadcrumbs')
+            item['ad_targeting'] = active_listing.get('adTargeting')
+            item['attachments'] = active_listing.get('attachments')
+            item['images'] = active_listing.get('images({"limit":300})')
+            item['images_preview'] = active_listing.get('images({"limit":0})')
+            item['thumbnail'] = active_listing.get('thumbnail')
+            item['photo_attribution'] = active_listing.get('photoAttribution')
+            item['price_change'] = active_listing.get('priceChange')
+            item['upcoming_open_houses'] = active_listing.get('upcomingOpenHouses')
+            item['floor_plan_images'] = active_listing.get('floorPlanImages')
+            item['video_attachment'] = active_listing.get('attachment({"type":"VIDEO"})')
+            item['three_d_attachment'] = active_listing.get('attachment({"type":"THREE_D"})')
+            item['energy_classification'] = active_listing.get('energyClassification')
+            item['active_package'] = active_listing.get('activePackage')
+            item['seller_package_recommendation'] = active_listing.get('sellerPackageRecommendation')
+            housing_cooperative = _resolve_ref(
+                active_listing.get('housingCooperative'), apollo_state
+            )
+            item['housing_cooperative'] = housing_cooperative or None
+            if housing_cooperative:
+                item['housing_cooperative_name'] = housing_cooperative.get('name')
+            item['yearly_arrende_fee'] = _money_amount(active_listing.get('yearlyArrendeFee'))
+            item['yearly_leasehold_fee'] = _money_amount(active_listing.get('yearlyLeaseholdFee'))
+            item['land_area'] = active_listing.get('landArea')
+            item['formatted_land_area'] = active_listing.get('formattedLandArea')
+            item['formatted_living_area'] = active_listing.get('formattedLivingArea')
+            item['formatted_supplemental_area'] = active_listing.get('formattedSupplementalArea')
+            item['supplemental_area'] = active_listing.get('supplementalArea')
+            item['formatted_floor'] = active_listing.get('formattedFloor')
+            item['closest_water_distance_meters'] = active_listing.get('closestWaterDistanceMeters')
+            item['coastline_distance_meters'] = active_listing.get('coastlineDistanceMeters')
+            item['raw_listing'] = active_listing
+            item['raw_apollo_state'] = apollo_state
+            item['broker_raw'] = broker or None
+            item['broker_agency_raw'] = agency or None
+
+            item['price'] = _money_amount(active_listing.get('askingPrice'))
+            item['asked_price'] = item.get('price')
+            item['price_per_square_meter'] = _money_amount(
+                active_listing.get('squareMeterPrice')
+            )
+            item['sold_date'] = None
+            item['address'] = active_listing.get('streetAddress') or ''
+            item['geographic_area'] = active_listing.get('area') or ''
+        else:
+            item['price'] = props.get('selling_price')
+            item['asked_price'] = props.get('price')
+            item['price_per_square_meter'] = props.get('price_per_square_meter')
+            item['sold_date'] = props.get('sold_at_date')
+            item['address'] = props.get('street_address')
+            item['geographic_area'] = props.get('location')
         yield item
 
         prev_page_url = response.css('link[rel=prev]::attr(href)')\
