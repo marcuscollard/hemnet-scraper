@@ -547,11 +547,13 @@ class HemnetSpider(scrapy.Spider):
             item['sold_date'] = props.get('sold_at_date')
             item['address'] = props.get('street_address')
             item['geographic_area'] = props.get('location')
+        lat, lon = extract_coords(response)
+        item['latitude'] = lat
+        item['longitude'] = lon
         yield item
 
         prev_page_url = response.css('link[rel=prev]::attr(href)')\
             .extract_first()
-        lat, lon = extract_coords(response)
 
         if prev_page_url:
             yield self._make_request(prev_page_url, self.parse_prev_page,

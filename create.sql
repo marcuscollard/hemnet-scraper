@@ -2,6 +2,10 @@ DROP TABLE IF EXISTS hemnet_items;
 
 DROP TABLE IF EXISTS hemnet_comp_items;
 
+DROP TABLE IF EXISTS houm_favorites;
+
+DROP TABLE IF EXISTS houm_users;
+
 --
 --
 CREATE TABLE hemnet_items (
@@ -33,6 +37,8 @@ CREATE TABLE hemnet_items (
     biarea INTEGER,
     address VARCHAR DEFAULT '',
     geographic_area VARCHAR DEFAULT '',
+    latitude FLOAT,
+    longitude FLOAT,
     collected_at DATE,
     -- defaults to datetime.now() but stored as DATE
     title VARCHAR,
@@ -136,4 +142,37 @@ CREATE TABLE hemnet_comp_items (
     item_type VARCHAR,
     price_per_m2 INTEGER,
     collected_at DATE
+);
+
+CREATE TABLE houm_users (
+    id BIGSERIAL PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    name_key VARCHAR NOT NULL UNIQUE,
+    min_price INTEGER,
+    max_price INTEGER,
+    min_rooms FLOAT,
+    max_rooms FLOAT,
+    min_area FLOAT,
+    max_area FLOAT,
+    min_year INTEGER,
+    max_year INTEGER,
+    max_monthly_fee INTEGER,
+    housing_forms JSONB,
+    tenure JSONB,
+    municipalities JSONB,
+    regions JSONB,
+    districts JSONB,
+    prefer_new_construction BOOLEAN,
+    prefer_upcoming BOOLEAN,
+    max_coast_distance_m INTEGER,
+    max_water_distance_m INTEGER,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE houm_favorites (
+    user_id BIGINT NOT NULL REFERENCES houm_users(id) ON DELETE CASCADE,
+    hemnet_id BIGINT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, hemnet_id)
 );

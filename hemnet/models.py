@@ -69,6 +69,8 @@ class HemnetItem(DeclarativeBase):
 
     address = Column(String, default='')
     geographic_area = Column(String, default='')
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     collected_at = Column(Date, default=datetime.now())
 
     listing_url = Column(String, nullable=True)

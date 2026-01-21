@@ -41,6 +41,8 @@ class HemnetItem(scrapy.Item):
 
     address = scrapy.Field()
     geographic_area = scrapy.Field()
+    latitude = scrapy.Field()
+    longitude = scrapy.Field()
 
     title = scrapy.Field()
     description = scrapy.Field()
