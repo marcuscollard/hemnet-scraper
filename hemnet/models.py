@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, Boolean, BigInteger
 from sqlalchemy.engine.url import URL
 from sqlalchemy.ext.declarative import declarative_base
 
@@ -10,6 +10,9 @@ DeclarativeBase = declarative_base()
 
 
 def db_connect():
+    database_url = getattr(settings, "DATABASE_URL", None)
+    if database_url:
+        return create_engine(database_url)
     return create_engine(URL(**settings.DATABASE))
 
 
@@ -20,9 +23,9 @@ def create_hemnet_table(engine):
 class HemnetItem(DeclarativeBase):
     __tablename__ = "hemnet_items"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    hemnet_id = Column(Integer, index=True)
+    hemnet_id = Column(BigInteger, index=True)
 
     url = Column(String)
 
@@ -59,10 +62,10 @@ class HemnetItem(DeclarativeBase):
 class HemnetCompItem(DeclarativeBase):
     __tablename__ = "hemnet_comp_items"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
 
-    salda_id = Column(Integer, index=True)
-    hemnet_id = Column(Integer, index=True)
+    salda_id = Column(BigInteger, index=True)
+    hemnet_id = Column(BigInteger, index=True)
 
     url = Column(String)
 

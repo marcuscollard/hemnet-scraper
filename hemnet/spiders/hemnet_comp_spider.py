@@ -4,6 +4,7 @@ import re
 import json
 import scrapy
 from scrapy.spidermiddlewares.httperror import HttpError
+from scrapy_playwright.page import PageMethod
 from twisted.internet.error import TimeoutError, TCPTimedOutError
 
 from sqlalchemy.orm import sessionmaker
@@ -20,11 +21,24 @@ class HemnetSpider(scrapy.Spider):
     name = 'hemnetcompspider'
     rotate_user_agent = True
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, use_browser='1', *args, **kwargs):
         super(HemnetSpider, self).__init__(*args, **kwargs)
+        self.use_browser = str(use_browser).lower() in ('1', 'true', 'yes', 'y')
+        self.playwright_page_methods = [
+            PageMethod("wait_for_load_state", "networkidle"),
+            PageMethod("wait_for_timeout", 1000),
+        ]
         engine = db_connect()
         create_hemnet_table(engine)
         self.session = sessionmaker(bind=engine)()
+
+    def _make_request(self, url, callback, errback=None, meta=None):
+        meta = dict(meta or {})
+        if self.use_browser:
+            meta.setdefault("playwright", True)
+            meta.setdefault("playwright_context", "default")
+            meta.setdefault("playwright_page_methods", self.playwright_page_methods)
+        return scrapy.Request(url, callback, errback=errback, meta=meta)
 
     def _write_err(self, code, url):
         with open(self.name + '_err.txt', 'a') as f:
@@ -47,27 +61,28 @@ class HemnetSpider(scrapy.Spider):
         comp_ids = [i for i, in session.query(HemnetCompSQL.salda_id).all()]
         for salda_id, url in salda_items:
             if salda_id not in comp_ids:
-                yield scrapy.Request(url, self.parse_salda,
-                                     errback=self.download_err_back,
-                    meta={'salda_id': salda_id})
+                yield self._make_request(url, self.parse_salda,
+                                         errback=self.download_err_back,
+                                         meta={'salda_id': salda_id})
 
     def parse_salda(self, response):
         prev_page_url = response.css('link[rel=prev]::attr(href)')\
             .extract_first()
-        pattern = 'coordinate.*\[(\d{2}\.\d+\,\d{2}\.\d+)\]'
-        g = re.search(pattern, response.body)
+        pattern = r'coordinate.*\[(\d{2}\.\d+\,\d{2}\.\d+)\]'
+        g = re.search(pattern, response.text)
         salda_id = response.meta['salda_id']
         try:
             lat, lon = map(float, g.group(1).split(','))
         except:
             lat, lon = None, None
-        yield scrapy.Request(prev_page_url, self.parse_detail_page,
-            meta={'lat': lat, 'lon': lon, 'salda_id': salda_id},
-            errback=self.download_err_back)
+        if prev_page_url:
+            yield self._make_request(prev_page_url, self.parse_detail_page,
+                                     meta={'lat': lat, 'lon': lon, 'salda_id': salda_id},
+                                     errback=self.download_err_back)
 
     def parse_detail_page(self, response):
-        pattern = 'dataLayer\s*=\s*(\[.*\]);'
-        g = re.search(pattern, response.body)
+        pattern = r'dataLayer\s*=\s*(\[[\s\S]*?\]);'
+        g = re.search(pattern, response.text)
         try:
             d = json.loads(g.group(1))
         except:

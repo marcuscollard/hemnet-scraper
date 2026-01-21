@@ -7,3 +7,6 @@ crawls
 project.egg-info
 eggs
 .idea/
+.env
+.env.local
+debug_html/

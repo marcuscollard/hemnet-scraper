@@ -2,14 +2,16 @@
 
 import re
 import json
+from pathlib import Path
 import scrapy
 
-from urlparse import urlparse, urljoin
-from urllib import urlencode
+from urllib.parse import urlparse, urljoin, urlencode
+
 from itertools import product
 
 from scrapy import Selector
 from scrapy.spidermiddlewares.httperror import HttpError
+from scrapy_playwright.page import PageMethod
 from twisted.internet.error import TimeoutError, TCPTimedOutError
 from sqlalchemy.orm import sessionmaker
 
@@ -21,7 +23,7 @@ from hemnet.models import (
 )
 
 
-BASE_URL = 'http://www.hemnet.se/salda/bostader?'
+BASE_URL = 'https://www.hemnet.se/bostader?published_since=3d&location_ids%5B%5D=17744'
 
 location_ids = [17744]
 item_types = ['radhus', 'bostadsratt', 'villa']
@@ -40,17 +42,28 @@ def url_queries(sold_age):
     }
 
     def _encode_query(params):
-        url_query = {
-            'location_ids[]': params['location_ids'],
-            'item_types[]': params['item_types'],
-            'rooms_min': params['rooms'],
-            'rooms_max': params['rooms'],
-            'living_area_min': params['living_area'][0],
-            'living_area_max': params['living_area'][1],
-            'fee_min': params['fee'][0],
-            'fee_max': params['fee'][1],
-            'sold_age': sold_age
-        }
+        url_query = {}
+        url_query['location_ids[]'] = params['location_ids']
+        url_query['item_types[]'] = params['item_types']
+
+        rooms_value = params['rooms']
+        if rooms_value is not None:
+            url_query['rooms_min'] = rooms_value
+            url_query['rooms_max'] = rooms_value
+
+        living_min, living_max = params['living_area']
+        if living_min is not None:
+            url_query['living_area_min'] = living_min
+        if living_max is not None:
+            url_query['living_area_max'] = living_max
+
+        fee_min, fee_max = params['fee']
+        if fee_min is not None:
+            url_query['fee_min'] = fee_min
+        if fee_max is not None:
+            url_query['fee_max'] = fee_max
+
+        url_query['sold_age'] = sold_age
         return urlencode(url_query)
 
     param_list = [dict(zip(d_, v)) for v in product(*d_.values())]
@@ -58,28 +71,138 @@ def url_queries(sold_age):
 
 
 def start_urls(sold_age):
-    return [BASE_URL + qry for qry in url_queries(sold_age)]
+    return [BASE_URL]
+
+
+def extract_listing_urls(response):
+    selectors = [
+        '#search-results li > div > a::attr("href")',
+        'a[data-test="search-result-item-link"]::attr("href")',
+        'a[data-testid="listing-card-link"]::attr("href")',
+        'a[data-testid="search-result-item-link"]::attr("href")',
+        'a.listing-card__link::attr("href")',
+        'a.hcl-link::attr("href")',
+    ]
+
+    urls = []
+    for selector in selectors:
+        urls.extend(response.css(selector).getall())
+
+    if not urls:
+        for href in response.css('a::attr("href")').getall():
+            if not href:
+                continue
+            if "/bostad/" not in href and "/salda/" not in href:
+                continue
+            if not re.search(r"-\d+$", href.strip("/")):
+                continue
+            urls.append(href)
+
+    # Preserve order while deduplicating.
+    return list(dict.fromkeys(urls))
+
+
+def _extract_next_data(response):
+    script = response.css('script#__NEXT_DATA__::text').get()
+    if not script:
+        return None
+    try:
+        return json.loads(script)
+    except Exception:
+        return None
+
+
+def _find_property_data(node):
+    if isinstance(node, dict):
+        if "sold_property" in node and isinstance(node["sold_property"], dict):
+            return node["sold_property"]
+        if "soldProperty" in node and isinstance(node["soldProperty"], dict):
+            return node["soldProperty"]
+        if "property" in node and isinstance(node["property"], dict):
+            if "id" in node["property"]:
+                return node["property"]
+        if "id" in node and (
+            "selling_price" in node
+            or "sellingPrice" in node
+            or "sold_at_date" in node
+            or "soldAtDate" in node
+        ):
+            return node
+        for value in node.values():
+            found = _find_property_data(value)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = _find_property_data(item)
+            if found:
+                return found
+    return None
+
+
+def _normalize_props(props):
+    if not props:
+        return {}
+    mapping = {
+        "sellingPrice": "selling_price",
+        "soldAtDate": "sold_at_date",
+        "livingArea": "living_area",
+        "streetAddress": "street_address",
+        "brokerAgency": "broker_agency",
+        "pricePerSqm": "price_per_square_meter",
+        "pricePerSquareMeter": "price_per_square_meter",
+        "askingPrice": "price",
+    }
+    normalized = dict(props)
+    for camel, snake in mapping.items():
+        if camel in normalized and snake not in normalized:
+            normalized[snake] = normalized.get(camel)
+    return normalized
 
 
 class HemnetSpider(scrapy.Spider):
     name = 'hemnetspider'
     rotate_user_agent = True
 
-    def __init__(self, sold_age='1m', *args, **kwargs):
+    def __init__(self, sold_age='1m', use_browser='1', *args, **kwargs):
         super(HemnetSpider, self).__init__(*args, **kwargs)
         self.sold_age = sold_age
+        self.use_browser = str(use_browser).lower() in ('1', 'true', 'yes', 'y')
+        self.playwright_page_methods = [
+            PageMethod("wait_for_load_state", "networkidle"),
+            PageMethod("wait_for_timeout", 1000),
+        ]
         engine = db_connect()
         create_hemnet_table(engine)
         self.session = sessionmaker(bind=engine)()
 
+    def _make_request(self, url, callback, errback=None, meta=None):
+        meta = dict(meta or {})
+        if self.use_browser:
+            meta.setdefault("playwright", True)
+            meta.setdefault("playwright_context", "default")
+            meta.setdefault("playwright_page_methods", self.playwright_page_methods)
+        return scrapy.Request(url, callback, errback=errback, meta=meta)
+
     def start_requests(self):
         for url in start_urls(self.sold_age):
-            yield scrapy.Request(url, self.parse,
-                                 errback=self.download_err_back)
+            yield self._make_request(url, self.parse,
+                                     errback=self.download_err_back)
 
     def _write_err(self, code, url):
         with open(self.name + '_err.txt', 'a') as f:
             f.write('{}: {}\n'.format(code, url))
+
+    def _save_debug_html(self, response, reason):
+        slug = urlparse(response.url).path.strip("/").replace("/", "_")
+        if not slug:
+            slug = "listing"
+        safe_slug = re.sub(r"[^a-zA-Z0-9_-]", "_", slug)
+        out_dir = Path(__file__).resolve().parents[2] / "debug_html"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{safe_slug}_{reason}.html"
+        if not out_path.exists():
+            out_path.write_text(response.text, encoding="utf-8")
 
     def download_err_back(self, failure):
         if failure.check(HttpError):
@@ -93,25 +216,33 @@ class HemnetSpider(scrapy.Spider):
             self._write_err('Other', request.url)
 
     def parse(self, response):
-        urls = response.css('#search-results li > div > a::attr("href")')
-        for url in urls.extract():
+        urls = extract_listing_urls(response)
+        for url in urls:
+            url = urljoin(response.url, url)
+            try:
+                hemnet_id = get_hemnet_id(url)
+            except Exception:
+                self._write_err('BadUrl', url)
+                continue
             session = self.session
             q = session.query(HemnetSQL)\
-                .filter(HemnetSQL.hemnet_id == get_hemnet_id(url))
+                .filter(HemnetSQL.hemnet_id == hemnet_id)
             if not session.query(q.exists()).scalar():
-                yield scrapy.Request(url, self.parse_detail_page,
-                                     errback=self.download_err_back)
+                yield self._make_request(url, self.parse_detail_page,
+                                         errback=self.download_err_back)
 
         next_href = response.css('a.next_page::attr("href")').extract_first()
         if next_href:
             next_url = urljoin(response.url, next_href)
-            scrapy.Request(next_url, self.parse_detail_page,
-                           errback=self.download_err_back)
+            yield self._make_request(next_url, self.parse,
+                                     errback=self.download_err_back)
 
     @staticmethod
     def _get_layer_data(response):
-        pattern = 'dataLayer\s*=\s*(\[.*\]);'
-        g = re.search(pattern, response.body)
+        pattern = r'dataLayer\s*=\s*(\[[\s\S]*?\]);'
+        g = re.search(pattern, response.text)
+        if not g:
+            raise ValueError("dataLayer not found")
         d = json.loads(g.group(1))
         return d
 
@@ -120,26 +251,49 @@ class HemnetSpider(scrapy.Spider):
         props = {}
         try:
             layer_data = self._get_layer_data(response)
-        except:
+        except Exception:
             self._write_err('JSONError', response.url)
-        else:
-            props = next((el for el in layer_data if u'sold_property' in el),
-                         {}).get('sold_property', {})
+            layer_data = []
+
+        if layer_data:
+            sold_entry = next(
+                (el for el in layer_data if u'sold_property' in el), None
+            )
+            if sold_entry:
+                props = sold_entry.get('sold_property', {})
+            else:
+                prop_entry = next(
+                    (el for el in layer_data if u'property' in el), None
+                )
+                if prop_entry:
+                    props = prop_entry.get('property', {})
+
+        if not props:
+            next_data = _extract_next_data(response)
+            if next_data:
+                props = _find_property_data(next_data) or {}
+                props = _normalize_props(props)
+
+        if not props:
+            self._write_err('NoProps', response.url)
+            self._save_debug_html(response, "no_props")
+            return
 
         item = HemnetItem()
 
-        # type: Selector
-        broker_sel = response.css('.broker-contact-card__information')[0]
+        broker_sel = response.css('.broker-contact-card__information')
+        broker_node = broker_sel[0] if broker_sel else None
         property_attributes = get_property_attributes(response)
 
         item['url'] = response.url
         slug = urlparse(response.url).path.split('/')[-1]
-        item['hemnet_id'] = props.get('id')
+        item['hemnet_id'] = props.get('id') or get_hemnet_id(response.url)
         item['type'] = slug.split('-')[0]
 
         raw_rooms = props.get('rooms')
         try:
-            item['rooms'] = float(raw_rooms)
+            if raw_rooms is not None:
+                item['rooms'] = float(raw_rooms)
         except Exception:
             pass
 
@@ -151,8 +305,10 @@ class HemnetSpider(scrapy.Spider):
         item['monthly_fee'] = fee
 
         try:
-            item['square_meters'] = float(props.get('living_area'))
-        except ValueError:
+            living_area = props.get('living_area')
+            if living_area is not None:
+                item['square_meters'] = float(living_area)
+        except Exception:
             pass
 
         try:
@@ -185,25 +341,27 @@ class HemnetSpider(scrapy.Spider):
             biarea = None
         item['biarea'] = biarea
 
-        item['broker_name'] = broker_sel.css('strong::text')\
-            .extract_first().strip()
-        phone, encoded_email = broker_sel.\
-            css('a.broker-contact__link::attr("href")').extract()
-        item['broker_phone'] = strip_phone(phone)
-
-        try:
-            item['broker_email'] = decode_email(encoded_email).split('?')[0]
-        except:
-            pass
+        if broker_node is not None:
+            broker_name = broker_node.css('strong::text').extract_first()
+            item['broker_name'] = broker_name.strip() if broker_name else ""
+            broker_links = broker_node.css(
+                'a.broker-contact__link::attr("href")'
+            ).extract()
+            if broker_links:
+                item['broker_phone'] = strip_phone(broker_links[0])
+            if len(broker_links) > 1:
+                try:
+                    item['broker_email'] = decode_email(broker_links[1]).split('?')[0]
+                except Exception:
+                    pass
 
         item['broker_firm'] = props.get('broker_agency')
 
-        try:
-            firm_phone = (broker_sel.css('.phone-number::attr("href")')[1])\
-                .extract()
-            broker_firm_phone = strip_phone(firm_phone)
-        except:
-            broker_firm_phone = None
+        broker_firm_phone = None
+        if broker_node is not None:
+            firm_links = broker_node.css('.phone-number::attr("href")').extract()
+            if len(firm_links) > 1:
+                broker_firm_phone = strip_phone(firm_links[1])
         item['broker_firm_phone'] = broker_firm_phone
         item['price'] = props.get('selling_price')
         item['asked_price'] = props.get('price')
@@ -216,10 +374,11 @@ class HemnetSpider(scrapy.Spider):
             .extract_first()
         lat, lon = extract_coords(response)
 
-        yield scrapy.Request(prev_page_url, self.parse_prev_page,
-                             meta={'lat': lat, 'lon': lon,
-                                   'salda_id': props['id']},
-                             errback=self.download_err_back)
+        if prev_page_url:
+            yield self._make_request(prev_page_url, self.parse_prev_page,
+                                     meta={'lat': lat, 'lon': lon,
+                                           'salda_id': props.get('id')},
+                                     errback=self.download_err_back)
 
     def parse_prev_page(self, response):
         try:
@@ -275,8 +434,8 @@ class HemnetSpider(scrapy.Spider):
 
 
 def extract_coords(response):
-    coord_pattern = 'coordinate.*\[(\d{2}\.\d+\,\d{2}\.\d+)\]'
-    g = re.search(coord_pattern, response.body)
+    coord_pattern = r'coordinate.*\[(\d{2}\.\d+\,\d{2}\.\d+)\]'
+    g = re.search(coord_pattern, response.text)
     try:
         lat, lon = map(float, g.group(1).split(','))
     except:

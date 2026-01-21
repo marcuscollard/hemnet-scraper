@@ -1,0 +1,71 @@
+--
+--
+CREATE TABLE hemnet_items (
+    id INTEGER PRIMARY KEY,
+    hemnet_id INTEGER,
+    -- indexed
+    url VARCHAR,
+    broker_name VARCHAR DEFAULT '',
+    broker_phone VARCHAR DEFAULT '',
+    broker_email VARCHAR DEFAULT '',
+    -- indexed
+    broker_firm VARCHAR,
+    broker_firm_phone VARCHAR,
+    sold_date DATE,
+    price_per_square_meter FLOAT,
+    price INTEGER,
+    asked_price INTEGER,
+    price_trend_flat INTEGER,
+    price_trend_percentage INTEGER,
+    rooms FLOAT,
+    monthly_fee INTEGER,
+    square_meters FLOAT,
+    cost_per_year INTEGER,
+    year VARCHAR DEFAULT '',
+    type VARCHAR DEFAULT '',
+    association VARCHAR,
+    lot_size INTEGER,
+    biarea INTEGER,
+    address VARCHAR DEFAULT '',
+    geographic_area VARCHAR DEFAULT '',
+    collected_at DATE -- defaults to datetime.now() but stored as DATE
+);
+
+CREATE TABLE hemnet_comp_items (
+    id INTEGER PRIMARY KEY,
+    salda_id INTEGER,
+    -- indexed
+    hemnet_id INTEGER,
+    -- indexed
+    url VARCHAR,
+    lattitude FLOAT,
+    longitude FLOAT,
+    city VARCHAR,
+    postal_city VARCHAR,
+    district VARCHAR,
+    country VARCHAR,
+    region VARCHAR,
+    municipality VARCHAR,
+    street VARCHAR,
+    location VARCHAR,
+    main_location VARCHAR,
+    street_address VARCHAR,
+    offers_selling_price BOOLEAN,
+    living_area FLOAT,
+    rooms FLOAT,
+    broker_firm VARCHAR,
+    new_production BOOLEAN,
+    upcoming_open_houses BOOLEAN DEFAULT false,
+    home_swapping BOOLEAN,
+    has_price_change BOOLEAN,
+    has_active_toplisting BOOLEAN,
+    status VARCHAR,
+    price INTEGER,
+    cost_per_year INTEGER,
+    monthly_fee INTEGER,
+    publication_date DATE,
+    images_count INTEGER,
+    item_type VARCHAR,
+    price_per_m2 INTEGER,
+    collected_at DATE
+);

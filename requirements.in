@@ -1,4 +1,6 @@
 scrapy
+scrapy-playwright
+playwright
 scrapyd
 scrapyd-client
 sqlalchemy

@@ -1,0 +1,20 @@
+# Conda environment for hemnet-scraper (Scrapy + Postgres + MCP tooling).
+# Create with: conda env create -f environment.yml
+name: scraper
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - scrapy
+  - lxml
+  - sqlalchemy
+  - psycopg2
+  - pip:
+      - playwright
+      - scrapy-playwright
+      - mcp[cli]
+      - python-dotenv
+      - httpx
+      - rich
+      - typer
